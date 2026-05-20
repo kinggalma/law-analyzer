@@ -9,6 +9,9 @@
 # 로그
 *.log
 
+# Streamlit secrets (절대 업로드 금지)
+.streamlit/secrets.toml
+
 # Python 캐시
 __pycache__/
 *.pyc
