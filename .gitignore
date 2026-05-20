@@ -1,0 +1,19 @@
+# 대용량 PDF 원본 파일 (law_data.xlsx로 이미 변환됨)
+25년 이후 법개정/
+법규 Sumary.pdf
+
+# 로컬 실행 파일
+시작.bat
+방화벽_설정_관리자권한필요.bat
+
+# 로그
+*.log
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# 임시 파일
+*.hwp

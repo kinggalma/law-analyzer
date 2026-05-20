@@ -1,0 +1,18 @@
+cookie:
+  expiry_days: 30
+  key: toc_analyzer_secret_key_2024
+  name: toc_analyzer_cookie
+credentials:
+  usernames:
+    admin:
+      email: admin@example.com
+      name: admin
+      password: $2b$12$ues2HPDyZvBF17vkx7/.heMaZVqQ1fNBm2h0BOQKvEsmIRtxQDkwG
+    guess902:
+      email: guess902@gmail.com
+      name: guess902
+      password: $2b$12$sl7Bhm0ELfGPsBoVa8R9ruVuNEp5ikhxYQWnAFP8WLzZJZGwYSHvq
+    kinggalma:
+      email: ''
+      name: kinggalma
+      password: $2b$12$RjDq2VkogdfyIWtpTOSy8.1EF164tVMFgYXt0R3Bq7mP65BlHr/PG

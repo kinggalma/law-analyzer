@@ -1,0 +1,12 @@
+# 앱 실행 의존성 포함
+-r requirements.txt
+
+# PDF 텍스트 추출 (로컬 실행 전용)
+pdfplumber
+pymupdf
+
+# HWP 파싱 시도
+olefile
+
+# 이미지 스캔 PDF OCR (필요한 경우에만 설치 — 용량 큼)
+# easyocr
