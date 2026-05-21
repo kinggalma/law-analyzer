@@ -108,6 +108,13 @@ def get_auth_config():
     except Exception as exc:
         print(f"[auth] Streamlit secrets 로드 실패: {exc}")
 
+    try:
+        secrets_config = st.secrets.get("AUTH_CONFIG_YAML") or st.secrets.get("auth_config_yaml")
+        if secrets_config:
+            return yaml.safe_load(str(secrets_config).replace("\\n", "\n"))
+    except Exception as exc:
+        print(f"[auth] Streamlit AUTH_CONFIG_YAML 로드 실패: {exc}")
+
     env_config = os.environ.get("AUTH_CONFIG_YAML")
     if env_config:
         try:
