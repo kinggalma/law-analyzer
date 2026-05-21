@@ -20,13 +20,18 @@ from sklearn.metrics.pairwise import cosine_similarity
 import plotly.express as px
 
 # ── 상수 ─────────────────────────────────────────────────────────────────────
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "law_data.xlsx")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "data", "law_data.xlsx")
+CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
 SHEET_NAME = "법령조문"
 REQUIRED_COLUMNS = [
     "법령명", "법령코드", "편장절", "조문번호", "조문제목",
     "조문내용", "시행일", "개정여부", "검색텍스트",
 ]
 OPTIONAL_COLUMNS = ["개정전조문내용", "변경유형", "개정내용요약"]
+EDITABLE_COLUMNS = [
+    "법령명", "법령코드", "시행일", "개정여부", "변경유형", "개정내용요약",
+]
 
 LAW_COLORS = {
     "산안법":    "#1565C0",
@@ -56,6 +61,27 @@ AMENDMENT_BADGE = {
     "new":      ("신설", "#C62828"),
 }
 
+LAW_INFERENCE_RULES = [
+    ("산업안전보건기준에 관한 규칙", "산업안전보건기준에 관한 규칙", "산안기준"),
+    ("산업안전보건기준", "산업안전보건기준에 관한 규칙", "산안기준"),
+    ("산업안전보건법", "산업안전보건법", "산안법"),
+    ("건설기술진흥법", "건설기술진흥법", "건진법"),
+    ("시설물의 안전 및 유지관리에 관한 특별법", "시설물의 안전 및 유지관리에 관한 특별법", "시설물법"),
+    ("시설물안전법", "시설물의 안전 및 유지관리에 관한 특별법", "시설물법"),
+    ("중대재해 처벌 등에 관한 법률", "중대재해처벌법", "중처법"),
+    ("중대재해처벌법", "중대재해처벌법", "중처법"),
+    ("산업안전보건관리비", "산업안전보건관리비", "산안관리비"),
+    ("콘크리트공사 표준안전 작업지침", "콘크리트공사 표준안전 작업지침", "콘크리트"),
+    ("KCS 14 20 40", "콘크리트공사 표준안전 작업지침", "콘크리트"),
+    ("한중콘크리트", "콘크리트공사 표준안전 작업지침", "콘크리트"),
+    ("콘크리트", "콘크리트공사 표준안전 작업지침", "콘크리트"),
+]
+
+DATE_PATTERNS = [
+    re.compile(r"(\d{4})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})"),
+    re.compile(r"(\d{2})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})"),
+]
+
 
 # ── 인증 설정 로딩 ─────────────────────────────────────────────────────────────
 
@@ -79,12 +105,18 @@ def get_auth_config():
                     "expiry_days": int(st.secrets["cookie"]["expiry_days"]),
                 },
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[auth] Streamlit secrets 로드 실패: {exc}")
 
-    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path, encoding="utf-8-sig") as f:
+    env_config = os.environ.get("AUTH_CONFIG_YAML")
+    if env_config:
+        try:
+            return yaml.safe_load(env_config.replace("\\n", "\n"))
+        except yaml.YAMLError as exc:
+            print(f"[auth] AUTH_CONFIG_YAML 파싱 실패: {exc}")
+
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             return yaml.load(f, Loader=SafeLoader)
 
     return None
@@ -150,6 +182,8 @@ def load_data(_mtime: float | None = None) -> pd.DataFrame:
     for col in OPTIONAL_COLUMNS:
         if col not in df.columns:
             df[col] = ""
+    if "id" not in df.columns:
+        df["id"] = range(1, len(df) + 1)
 
     df = df[df["조문내용"].ne("")]
     df["검색텍스트"] = (
@@ -160,6 +194,61 @@ def load_data(_mtime: float | None = None) -> pd.DataFrame:
     )
     df = df.reset_index(drop=True)
     return df
+
+
+def make_search_text(row: pd.Series) -> str:
+    return " ".join(
+        str(row.get(col, "")).strip()
+        for col in ["법령명", "조문번호", "조문제목", "조문내용"]
+        if str(row.get(col, "")).strip()
+    )
+
+
+def infer_law_info(row: pd.Series) -> tuple[str, str]:
+    haystack = " ".join(
+        str(row.get(col, ""))
+        for col in ["법령명", "조문제목", "조문내용", "출처파일", "개정내용요약"]
+    )
+    for keyword, law_name, law_code in LAW_INFERENCE_RULES:
+        if keyword in haystack:
+            return law_name, law_code
+    return str(row.get("법령명", "")).strip(), str(row.get("법령코드", "")).strip()
+
+
+def infer_enforcement_date(row: pd.Series) -> str:
+    haystack = " ".join(
+        str(row.get(col, ""))
+        for col in ["출처파일", "개정내용요약", "조문내용"]
+    )
+    for pat in DATE_PATTERNS:
+        match = pat.search(haystack)
+        if not match:
+            continue
+        year, month, day = match.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return str(row.get("시행일", "")).strip()
+
+
+def normalize_amendment(row: pd.Series) -> str:
+    current = str(row.get("개정여부", "")).strip()
+    if current in {"original", "amended", "new"}:
+        return current
+    if is_new_article(row):
+        return "new"
+    source = str(row.get("출처파일", "")).strip()
+    if source and source != "법규 Sumary.pdf":
+        return "amended"
+    return "original"
+
+
+def save_law_data(updated_df: pd.DataFrame) -> None:
+    sheets = pd.read_excel(DATA_PATH, sheet_name=None)
+    history_df = sheets.get("개정이력", pd.DataFrame())
+    with pd.ExcelWriter(DATA_PATH, engine="openpyxl") as writer:
+        updated_df.to_excel(writer, sheet_name=SHEET_NAME, index=False)
+        history_df.to_excel(writer, sheet_name="개정이력", index=False)
 
 
 @st.cache_resource(show_spinner="TF-IDF 인덱스 구축 중...")
@@ -449,7 +538,12 @@ def main():
         return result_df
 
     # ── 탭 구성 ───────────────────────────────────────────────────────────────
-    tab1, tab2, tab3 = st.tabs(["🔍 법령 조문 검색", "📋 개정사항 분석", "📖 법령별 조문 보기"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 법령 조문 검색",
+        "📋 개정사항 분석",
+        "📖 법령별 조문 보기",
+        "🛠 데이터 보정",
+    ])
 
     # ── TAB 1: 법령 검색 ──────────────────────────────────────────────────────
     with tab1:
@@ -641,6 +735,139 @@ def main():
 
         for _, row in law_df.iterrows():
             render_law_card(row, keyword="", score=None, original_lookup=original_lookup)
+
+    # ── TAB 4: 데이터 보정 ────────────────────────────────────────────────────
+    with tab4:
+        st.subheader("법령명·시행일 보정")
+        st.caption(
+            "`기타`로 분류되었거나 시행일이 `미상`인 항목을 보정합니다. "
+            "저장하면 검색, 법령별 보기, 개정사항 분석에 바로 반영됩니다."
+        )
+
+        correction_scope = st.radio(
+            "보정 대상",
+            ["기타/시행일 미상", "개정·신설 전체", "전체"],
+            horizontal=True,
+        )
+
+        source_options = ["전체"] + sorted([
+            source for source in df.get("출처파일", pd.Series(dtype=str)).astype(str).unique()
+            if source
+        ])
+        source_filter = st.selectbox("출처파일 필터", source_options)
+
+        correction_df = df.copy()
+        if correction_scope == "기타/시행일 미상":
+            mask = (
+                correction_df["법령코드"].eq("기타")
+                | correction_df["법령명"].isin(["기타", "법규 요약", ""])
+                | correction_df["시행일"].isin(["미상", ""])
+            )
+            correction_df = correction_df[mask]
+        elif correction_scope == "개정·신설 전체":
+            correction_df = correction_df[correction_df["개정여부"].isin(["amended", "new"])]
+
+        if source_filter != "전체":
+            correction_df = correction_df[correction_df["출처파일"].astype(str).eq(source_filter)]
+
+        st.markdown(f"**보정 대상: {len(correction_df):,}개**")
+
+        if correction_df.empty:
+            st.info("현재 조건에 해당하는 보정 대상이 없습니다.")
+        else:
+            c1, c2 = st.columns([1, 5])
+            with c1:
+                auto_clicked = st.button("자동 추정 적용", type="secondary")
+            with c2:
+                st.caption("법령명·법령코드는 파일명/조문내용의 주요 법령명을, 시행일은 파일명/내용의 날짜를 기준으로 추정합니다.")
+
+            if auto_clicked:
+                updated_df = df.copy()
+                changed = 0
+                for idx, row in correction_df.iterrows():
+                    new_name, new_code = infer_law_info(row)
+                    new_date = infer_enforcement_date(row)
+                    new_status = normalize_amendment(row)
+
+                    before = updated_df.loc[idx, ["법령명", "법령코드", "시행일", "개정여부"]].astype(str).tolist()
+                    updated_df.loc[idx, "법령명"] = new_name or row.get("법령명", "")
+                    updated_df.loc[idx, "법령코드"] = new_code or row.get("법령코드", "")
+                    updated_df.loc[idx, "시행일"] = new_date or row.get("시행일", "")
+                    updated_df.loc[idx, "개정여부"] = new_status
+                    updated_df.loc[idx, "검색텍스트"] = make_search_text(updated_df.loc[idx])
+                    after = updated_df.loc[idx, ["법령명", "법령코드", "시행일", "개정여부"]].astype(str).tolist()
+                    if before != after:
+                        changed += 1
+
+                save_law_data(updated_df)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success(f"자동 추정으로 {changed:,}개 항목을 보정했습니다.")
+                st.rerun()
+
+            editor_df = correction_df.copy()
+            editor_df["조문내용 미리보기"] = editor_df["조문내용"].astype(str).str.replace("\n", " ", regex=False).str[:180]
+            editor_cols = [
+                "id", "법령명", "법령코드", "시행일", "개정여부", "변경유형", "개정내용요약",
+                "출처파일", "조문번호", "조문제목", "조문내용 미리보기",
+            ]
+            editor_df = editor_df[[col for col in editor_cols if col in editor_df.columns]]
+
+            law_code_options = sorted(set(LAW_NAMES.keys()) | set(df["법령코드"].astype(str).unique()))
+            edited_df = st.data_editor(
+                editor_df,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["id", "출처파일", "조문번호", "조문제목", "조문내용 미리보기"],
+                column_config={
+                    "법령코드": st.column_config.SelectboxColumn("법령코드", options=law_code_options),
+                    "개정여부": st.column_config.SelectboxColumn(
+                        "개정여부",
+                        options=["original", "amended", "new"],
+                        help="original=원본, amended=개정, new=신설",
+                    ),
+                    "시행일": st.column_config.TextColumn(
+                        "시행일",
+                        help="YYYY-MM-DD 형식 권장. 확인 전이면 미상 입력",
+                    ),
+                    "조문내용 미리보기": st.column_config.TextColumn("조문내용 미리보기", width="large"),
+                },
+            )
+
+            if st.button("보정 내용 저장", type="primary"):
+                updated_df = df.copy()
+                changed = 0
+                id_to_index = {
+                    str(row_id): idx for idx, row_id in updated_df["id"].astype(str).items()
+                }
+
+                for _, edited_row in edited_df.iterrows():
+                    row_id = str(edited_row.get("id", "")).strip()
+                    if row_id not in id_to_index:
+                        continue
+                    idx = id_to_index[row_id]
+                    before = updated_df.loc[idx, EDITABLE_COLUMNS].astype(str).tolist()
+
+                    for col in EDITABLE_COLUMNS:
+                        if col in edited_row.index:
+                            updated_df.loc[idx, col] = str(edited_row[col]).strip()
+
+                    if "신설" in str(updated_df.loc[idx, "변경유형"]) or "신설" in str(updated_df.loc[idx, "개정내용요약"]):
+                        updated_df.loc[idx, "개정여부"] = "new"
+                    elif str(updated_df.loc[idx, "개정여부"]).strip() == "":
+                        updated_df.loc[idx, "개정여부"] = normalize_amendment(updated_df.loc[idx])
+
+                    updated_df.loc[idx, "검색텍스트"] = make_search_text(updated_df.loc[idx])
+                    after = updated_df.loc[idx, EDITABLE_COLUMNS].astype(str).tolist()
+                    if before != after:
+                        changed += 1
+
+                save_law_data(updated_df)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success(f"{changed:,}개 항목의 보정 내용을 저장했습니다.")
+                st.rerun()
 
 
 if __name__ == "__main__":

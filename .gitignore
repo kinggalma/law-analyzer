@@ -10,6 +10,7 @@
 *.log
 
 # Streamlit secrets (절대 업로드 금지)
+config.yaml
 .streamlit/secrets.toml
 
 # Python 캐시
