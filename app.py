@@ -863,6 +863,7 @@ def main():
             ]
             editor_df = editor_df[[col for col in editor_cols if col in editor_df.columns]]
 
+            law_name_options_editor = sorted(LAW_NAMES.values())
             law_code_options = sorted(set(LAW_NAMES.keys()) | set(df["법령코드"].astype(str).unique()))
             edited_df = st.data_editor(
                 editor_df,
@@ -871,6 +872,11 @@ def main():
                 num_rows="fixed",
                 disabled=["id", "출처파일", "조문번호", "조문제목", "조문내용 미리보기"],
                 column_config={
+                    "법령명": st.column_config.SelectboxColumn(
+                        "법령명",
+                        options=law_name_options_editor,
+                        help="목록에 없는 법령명은 아래 '법령명 직접 입력' 섹션을 이용하세요.",
+                    ),
                     "법령코드": st.column_config.SelectboxColumn("법령코드", options=law_code_options),
                     "개정여부": st.column_config.SelectboxColumn(
                         "개정여부",
@@ -918,6 +924,100 @@ def main():
                 st.cache_resource.clear()
                 st.success(f"{changed:,}개 항목의 보정 내용을 저장했습니다.")
                 st.rerun()
+
+            # ── 법령명 직접 입력 (목록 외 사용자 정의) ──────────────────────
+            st.markdown("---")
+            with st.expander("✏️ 법령명 직접 입력 (목록에 없는 법령명 수정)"):
+                st.caption("위 표에서 선택할 수 없는 법령명을 직접 입력해 특정 조문에 적용합니다.")
+
+                def _row_label(row: pd.Series) -> str:
+                    parts = [
+                        str(row.get("법령명", "")).strip(),
+                        str(row.get("조문번호", "")).strip(),
+                        str(row.get("조문제목", "")).strip()[:25],
+                    ]
+                    return " | ".join(p for p in parts if p)
+
+                row_labels = [_row_label(r) for _, r in correction_df.iterrows()]
+                row_indices = correction_df.index.tolist()
+
+                if not row_labels:
+                    st.info("보정 대상 조문이 없습니다.")
+                else:
+                    sel_label = st.selectbox(
+                        "수정할 조문 선택",
+                        row_labels,
+                        key="indiv_row_sel",
+                    )
+                    sel_idx = row_indices[row_labels.index(sel_label)]
+                    sel_row = df.loc[sel_idx]
+
+                    # 법령명: 선택 목록 + 직접 입력
+                    DIRECT_INPUT = "— 직접 입력 —"
+                    law_name_opts = list(LAW_NAMES.values()) + [DIRECT_INPUT]
+                    current_name = str(sel_row.get("법령명", "")).strip()
+                    default_name_idx = (
+                        law_name_opts.index(current_name)
+                        if current_name in law_name_opts
+                        else len(law_name_opts) - 1
+                    )
+
+                    selected_name = st.selectbox(
+                        "법령명 선택",
+                        law_name_opts,
+                        index=default_name_idx,
+                        key="indiv_law_name_sel",
+                    )
+
+                    if selected_name == DIRECT_INPUT:
+                        custom_name = st.text_input(
+                            "법령명 직접 입력",
+                            value=current_name if current_name not in LAW_NAMES.values() else "",
+                            key="indiv_law_name_text",
+                        )
+                        final_name = custom_name.strip()
+                    else:
+                        final_name = selected_name
+
+                    # 법령코드: 선택한 법령명에 맞게 자동 추천
+                    auto_code = next(
+                        (code for code, name in LAW_NAMES.items() if name == final_name),
+                        str(sel_row.get("법령코드", "기타")).strip(),
+                    )
+                    code_opts = sorted(set(LAW_NAMES.keys()) | set(df["법령코드"].astype(str).unique()))
+                    code_idx = code_opts.index(auto_code) if auto_code in code_opts else 0
+                    final_code = st.selectbox(
+                        "법령코드",
+                        code_opts,
+                        index=code_idx,
+                        key="indiv_law_code",
+                    )
+
+                    final_date = st.text_input(
+                        "시행일 (YYYY-MM-DD)",
+                        value=str(sel_row.get("시행일", "")).strip(),
+                        key="indiv_date",
+                    )
+
+                    if st.button("이 조문 저장", type="primary", key="indiv_save"):
+                        if not final_name:
+                            st.error("법령명을 입력하세요.")
+                        else:
+                            updated_df = df.copy()
+                            before = updated_df.loc[sel_idx, EDITABLE_COLUMNS].astype(str).tolist()
+                            updated_df.loc[sel_idx, "법령명"] = final_name
+                            updated_df.loc[sel_idx, "법령코드"] = final_code
+                            updated_df.loc[sel_idx, "시행일"] = final_date.strip()
+                            updated_df.loc[sel_idx, "검색텍스트"] = make_search_text(updated_df.loc[sel_idx])
+                            after = updated_df.loc[sel_idx, EDITABLE_COLUMNS].astype(str).tolist()
+                            if before != after:
+                                save_law_data(updated_df)
+                                st.cache_data.clear()
+                                st.cache_resource.clear()
+                                st.success(f"저장 완료 → {final_name}")
+                                st.rerun()
+                            else:
+                                st.info("변경사항이 없습니다.")
 
 
 if __name__ == "__main__":
