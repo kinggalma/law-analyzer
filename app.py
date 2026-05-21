@@ -61,6 +61,14 @@ AMENDMENT_BADGE = {
     "new":      ("신설", "#C62828"),
 }
 
+AUTH_DIAGNOSTICS = {
+    "streamlit_secret_keys": [],
+    "auth_yaml_secret": False,
+    "auth_yaml_env": False,
+    "local_config": False,
+    "last_error": "",
+}
+
 LAW_INFERENCE_RULES = [
     ("산업안전보건기준에 관한 규칙", "산업안전보건기준에 관한 규칙", "산안기준"),
     ("산업안전보건기준", "산업안전보건기준에 관한 규칙", "산안기준"),
@@ -88,7 +96,20 @@ DATE_PATTERNS = [
 @st.cache_data(ttl=300)
 def get_auth_config():
     """Streamlit Cloud secrets → 로컬 config.yaml 순으로 인증 설정 로드."""
+    AUTH_DIAGNOSTICS.update({
+        "streamlit_secret_keys": [],
+        "auth_yaml_secret": False,
+        "auth_yaml_env": bool(os.environ.get("AUTH_CONFIG_YAML")),
+        "local_config": os.path.exists(CONFIG_PATH),
+        "last_error": "",
+    })
+
     try:
+        try:
+            AUTH_DIAGNOSTICS["streamlit_secret_keys"] = list(st.secrets.keys())
+        except Exception:
+            AUTH_DIAGNOSTICS["streamlit_secret_keys"] = []
+
         if "credentials" in st.secrets and "cookie" in st.secrets:
             credentials = {"usernames": {}}
             for uname, info in st.secrets["credentials"]["usernames"].items():
@@ -106,13 +127,20 @@ def get_auth_config():
                 },
             }
     except Exception as exc:
+        AUTH_DIAGNOSTICS["last_error"] = f"Streamlit secrets 직접 설정 오류: {exc}"
         print(f"[auth] Streamlit secrets 로드 실패: {exc}")
 
     try:
-        secrets_config = st.secrets.get("AUTH_CONFIG_YAML") or st.secrets.get("auth_config_yaml")
+        secrets_config = None
+        for key in ["AUTH_CONFIG_YAML", "auth_config_yaml", "AUTH_CONFIG", "auth_config"]:
+            if key in st.secrets:
+                secrets_config = st.secrets[key]
+                AUTH_DIAGNOSTICS["auth_yaml_secret"] = True
+                break
         if secrets_config:
             return yaml.safe_load(str(secrets_config).replace("\\n", "\n"))
     except Exception as exc:
+        AUTH_DIAGNOSTICS["last_error"] = f"AUTH_CONFIG_YAML 파싱 오류: {exc}"
         print(f"[auth] Streamlit AUTH_CONFIG_YAML 로드 실패: {exc}")
 
     env_config = os.environ.get("AUTH_CONFIG_YAML")
@@ -120,6 +148,7 @@ def get_auth_config():
         try:
             return yaml.safe_load(env_config.replace("\\n", "\n"))
         except yaml.YAMLError as exc:
+            AUTH_DIAGNOSTICS["last_error"] = f"환경변수 AUTH_CONFIG_YAML 파싱 오류: {exc}"
             print(f"[auth] AUTH_CONFIG_YAML 파싱 실패: {exc}")
 
     if os.path.exists(CONFIG_PATH):
@@ -127,6 +156,19 @@ def get_auth_config():
             return yaml.load(f, Loader=SafeLoader)
 
     return None
+
+
+def render_auth_diagnostics():
+    keys = AUTH_DIAGNOSTICS.get("streamlit_secret_keys", [])
+    st.caption(
+        "인증 설정 진단: "
+        f"Secrets keys={keys or '없음'}, "
+        f"AUTH_CONFIG_YAML secret={AUTH_DIAGNOSTICS.get('auth_yaml_secret')}, "
+        f"AUTH_CONFIG_YAML env={AUTH_DIAGNOSTICS.get('auth_yaml_env')}, "
+        f"local config.yaml={AUTH_DIAGNOSTICS.get('local_config')}"
+    )
+    if AUTH_DIAGNOSTICS.get("last_error"):
+        st.caption(f"마지막 오류: {AUTH_DIAGNOSTICS['last_error']}")
 
 
 st.set_page_config(
@@ -452,6 +494,7 @@ def main():
 
     if auth_config is None:
         st.error("⚠️ 인증 설정 파일(config.yaml)이 없습니다.")
+        render_auth_diagnostics()
         st.stop()
 
     authenticator = stauth.Authenticate(
