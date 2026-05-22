@@ -28,7 +28,7 @@ REQUIRED_COLUMNS = [
     "법령명", "법령코드", "편장절", "조문번호", "조문제목",
     "조문내용", "시행일", "개정여부", "검색텍스트",
 ]
-OPTIONAL_COLUMNS = ["개정전조문내용", "변경유형", "개정내용요약"]
+OPTIONAL_COLUMNS = ["개정전조문내용", "변경유형", "개정내용요약", "기준조문ID", "기준연결방식"]
 EDITABLE_COLUMNS = [
     "법령명", "법령코드", "시행일", "개정여부", "변경유형", "개정내용요약",
 ]
@@ -356,6 +356,18 @@ def is_new_article(row: pd.Series) -> bool:
     return status == "new" or "신설" in change_type or "신설" in summary or "신규" in summary
 
 
+def is_summary_source(source: str) -> bool:
+    source = str(source).lower()
+    return "법규 sumary.pdf" in source or "법규 summary.pdf" in source
+
+
+def is_summary_original(row: pd.Series) -> bool:
+    return (
+        str(row.get("개정여부", "")).strip() == "original"
+        and is_summary_source(str(row.get("출처파일", "")))
+    )
+
+
 def build_original_lookup(df: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
     original_df = df[df["개정여부"].eq("original")].copy()
     lookup = {}
@@ -364,6 +376,28 @@ def build_original_lookup(df: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
         if key[0] and key[1] and key not in lookup:
             lookup[key] = item
     return lookup
+
+
+def build_summary_amendment_lookup(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    amendments = df[df["개정여부"].isin(["amended", "new"])].copy()
+    if amendments.empty or "기준조문ID" not in amendments.columns:
+        return {}
+    amendments["기준조문ID"] = amendments["기준조문ID"].astype(str).str.strip()
+    amendments = amendments[amendments["기준조문ID"].ne("")]
+    return {base_id: group.copy() for base_id, group in amendments.groupby("기준조문ID")}
+
+
+def summarize_linked_amendments(linked_df: pd.DataFrame) -> tuple[str, str]:
+    if linked_df.empty:
+        return "", "#9E9E9E"
+    new_count = int(linked_df.apply(is_new_article, axis=1).sum())
+    amended_count = len(linked_df) - new_count
+    parts = []
+    if amended_count:
+        parts.append(f"개정 {amended_count}")
+    if new_count:
+        parts.append(f"신설 {new_count}")
+    return " / ".join(parts), "#C62828" if new_count else "#FF6F00"
 
 
 def render_comparison(row: pd.Series, keyword: str, original_lookup: dict[tuple[str, str], pd.Series] | None):
@@ -484,6 +518,58 @@ def render_law_card(
             )
 
 
+def render_summary_card(
+    row: pd.Series,
+    linked_df: pd.DataFrame,
+    keyword: str = "",
+    score: float | None = None,
+    original_lookup: dict[tuple[str, str], pd.Series] | None = None,
+):
+    law_code = row.get("법령코드", "기타")
+    color = LAW_COLORS.get(law_code, "#546E7A")
+    linked_badge, linked_color = summarize_linked_amendments(linked_df)
+    score_badge = f"  (유사도 {score}%)" if score is not None else ""
+
+    art_no = str(row.get("조문번호", "")).strip()
+    art_title = str(row.get("조문제목", "")).strip()
+    content = str(row.get("조문내용", "")).strip()
+    label_parts = [str(row.get("법령명", law_code)).strip(), art_no, art_title or content[:30]]
+    label = "  ".join(filter(None, label_parts)) + score_badge
+
+    with st.expander(f"📘 {label}"):
+        st.markdown(
+            f'<span style="background:{color};color:#fff;padding:2px 8px;'
+            f'border-radius:4px;font-size:0.8em">{row.get("법령명", law_code)}</span>'
+            + (
+                f'<span style="background:{linked_color};color:#fff;padding:2px 8px;'
+                f'border-radius:4px;font-size:0.8em;margin-left:6px">{linked_badge}</span>'
+                if linked_badge else ""
+            ),
+            unsafe_allow_html=True,
+        )
+        if str(row.get("편장절", "")).strip():
+            st.caption(str(row.get("편장절", "")).strip())
+        st.markdown("#### Summary 기준 조문")
+        st.markdown(
+            f'<div style="line-height:1.8;white-space:pre-wrap">{highlight(content, keyword)}</div>',
+            unsafe_allow_html=True,
+        )
+
+        if linked_df.empty:
+            st.caption("연결된 신규·개정 항목이 없습니다.")
+            return
+
+        st.markdown("---")
+        st.markdown("#### 연결된 신규·개정 사항")
+        for _, item in linked_df.iterrows():
+            render_law_card(
+                item,
+                keyword=keyword,
+                score=None,
+                original_lookup=original_lookup,
+            )
+
+
 # ── 메인 앱 ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -539,6 +625,8 @@ def main():
 
     vec, matrix = build_tfidf(df)
     original_lookup = build_original_lookup(df)
+    summary_df = df[df.apply(is_summary_original, axis=1)].copy()
+    summary_amendment_lookup = build_summary_amendment_lookup(df)
 
     # ── 사이드바 필터 ─────────────────────────────────────────────────────────
     with st.sidebar:
@@ -546,8 +634,8 @@ def main():
 
         search_mode = st.radio(
             "조문 조회 방식",
-            ["조문 키워드 검색", "관련 조문 유사도 검색 (TF-IDF)"],
-            help="키워드: 검색어가 직접 포함된 조문 / 유사도: 표현이 조금 달라도 관련성이 높은 조문",
+            ["Summary 기준 검색", "조문 키워드 검색", "관련 조문 유사도 검색 (TF-IDF)"],
+            help="Summary 기준: 법규 Sumary.pdf 원문을 먼저 찾고 연결된 개정사항을 함께 표시합니다.",
         )
 
         all_codes = sorted(df["법령코드"].unique().tolist())
@@ -573,6 +661,7 @@ def main():
         st.markdown("---")
         total = len(df)
         st.caption(f"총 조문 수: **{total:,}**개")
+        st.caption(f"Summary 기준 조문: **{len(summary_df):,}**개")
         for code in all_codes:
             cnt = len(df[df["법령코드"] == code])
             name = LAW_NAMES.get(code, code)
@@ -587,25 +676,51 @@ def main():
             result_df = result_df[result_df["개정여부"] == "original"]
         return result_df
 
-    # ── 탭 구성 ───────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs([
+    def apply_summary_filters(result_df: pd.DataFrame) -> pd.DataFrame:
+        result_df = result_df[result_df["법령코드"].isin(code_filter)]
+        if amendment_filter == "개정·신설만":
+            ids_with_change = set(summary_amendment_lookup.keys())
+            result_df = result_df[result_df["id"].astype(str).isin(ids_with_change)]
+        return result_df
+
+    # ── 화면 구성 ─────────────────────────────────────────────────────────────
+    page_options = [
         "🔍 법령 조문 검색",
         "📋 개정사항 분석",
         "📖 법령별 조문 보기",
         "🛠 데이터 보정",
-    ])
+    ]
+    selected_page = st.radio(
+        "메뉴",
+        page_options,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="law_main_page",
+    )
 
     # ── TAB 1: 법령 검색 ──────────────────────────────────────────────────────
-    with tab1:
+    if selected_page == page_options[0]:
         keyword = st.text_input(
             "🔍 법령·조문 검색어",
             placeholder="예: 비계, 안전난간, 산소결핍, 중대재해, 안전보건관리책임자",
         )
 
         if not keyword:
-            st.info("검색어를 입력하면 건설안전기술사 시험과 관련된 법령 조문을 찾아드립니다.")
+            st.info("검색어를 입력하면 법규 Sumary 기준 조문을 먼저 찾고, 연결된 신규·개정 사항을 함께 표시합니다.")
         else:
-            if search_mode == "조문 키워드 검색":
+            if search_mode == "Summary 기준 검색":
+                if summary_df.empty:
+                    st.error(
+                        "`법규 Sumary.pdf` 기준 데이터가 없습니다. 현재 PDF가 이미지 스캔이라 기존 추출에서는 건너뛰었습니다. "
+                        "`python extract_law.py`를 다시 실행해 OCR 추출을 수행한 뒤 조회하세요."
+                    )
+                    result_df = pd.DataFrame()
+                    scores = {}
+                else:
+                    result_df = search_keyword(summary_df, keyword)
+                    result_df = apply_summary_filters(result_df)
+                    scores = {i: None for i in result_df.index}
+            elif search_mode == "조문 키워드 검색":
                 result_df = search_keyword(df, keyword)
                 result_df = apply_filters(result_df)
                 scores = {i: None for i in result_df.index}
@@ -617,7 +732,8 @@ def main():
                 score_map = {i: s for i, s in sim_results}
                 scores = {i: score_map.get(i) for i in indices}
 
-            st.markdown(f"### 조문 검색 결과: **{len(result_df)}**개")
+            result_label = "Summary 기준 검색 결과" if search_mode == "Summary 기준 검색" else "조문 검색 결과"
+            st.markdown(f"### {result_label}: **{len(result_df)}**개")
 
             if result_df.empty:
                 st.warning("검색된 조문이 없습니다. 다른 법령 용어를 입력하거나 유사도 기준을 낮춰보세요.")
@@ -635,23 +751,43 @@ def main():
                         with ltab:
                             subset = result_df[result_df["법령코드"] == code]
                             for idx, row in subset.iterrows():
-                                render_law_card(
-                                    row,
-                                    keyword=keyword,
-                                    score=scores.get(idx),
-                                    original_lookup=original_lookup,
-                                )
+                                if search_mode == "Summary 기준 검색":
+                                    linked = summary_amendment_lookup.get(str(row.get("id", "")).strip(), pd.DataFrame())
+                                    render_summary_card(
+                                        row,
+                                        linked,
+                                        keyword=keyword,
+                                        score=scores.get(idx),
+                                        original_lookup=original_lookup,
+                                    )
+                                else:
+                                    render_law_card(
+                                        row,
+                                        keyword=keyword,
+                                        score=scores.get(idx),
+                                        original_lookup=original_lookup,
+                                    )
                 else:
                     for idx, row in result_df.iterrows():
-                        render_law_card(
-                            row,
-                            keyword=keyword,
-                            score=scores.get(idx),
-                            original_lookup=original_lookup,
-                        )
+                        if search_mode == "Summary 기준 검색":
+                            linked = summary_amendment_lookup.get(str(row.get("id", "")).strip(), pd.DataFrame())
+                            render_summary_card(
+                                row,
+                                linked,
+                                keyword=keyword,
+                                score=scores.get(idx),
+                                original_lookup=original_lookup,
+                            )
+                        else:
+                            render_law_card(
+                                row,
+                                keyword=keyword,
+                                score=scores.get(idx),
+                                original_lookup=original_lookup,
+                            )
 
     # ── TAB 2: 개정 현황 ──────────────────────────────────────────────────────
-    with tab2:
+    elif selected_page == page_options[1]:
         st.subheader("법령 개정사항 분석")
 
         amended_df = df[df["개정여부"].isin(["amended", "new"])].copy()
@@ -760,7 +896,7 @@ def main():
                 )
 
     # ── TAB 3: 법령별 조문 보기 ───────────────────────────────────────────────
-    with tab3:
+    elif selected_page == page_options[2]:
         st.subheader("법령별 조문 전체 보기")
 
         law_names_list = sorted(df["법령명"].unique().tolist())
@@ -787,7 +923,7 @@ def main():
             render_law_card(row, keyword="", score=None, original_lookup=original_lookup)
 
     # ── TAB 4: 데이터 보정 ────────────────────────────────────────────────────
-    with tab4:
+    elif selected_page == page_options[3]:
         st.subheader("법령명·시행일 보정")
         st.caption(
             "`기타`로 분류되었거나 시행일이 `미상`인 항목을 보정합니다. "

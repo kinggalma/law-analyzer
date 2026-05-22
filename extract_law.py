@@ -8,6 +8,7 @@
 import os
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pandas as pd
@@ -68,6 +69,8 @@ DATE_PATS    = [
     re.compile(r"(\d{4})\.(\d{1,2})\.(\d{2})\s*개정"),
 ]
 CHUNK_SIZE   = 500  # 조문 파싱 실패 시 글자 수 단위 청크
+SUMMARY_OCR_DPI = int(os.environ.get("SUMMARY_OCR_DPI", "170"))
+SUMMARY_OCR_MAX_PAGES = int(os.environ.get("SUMMARY_OCR_MAX_PAGES", "0"))
 
 
 # ── 유틸리티 함수 ─────────────────────────────────────────────────────────────
@@ -105,6 +108,27 @@ def guess_law_info(filename: str) -> tuple[str, str]:
         if law_name in filename:
             return law_name, law_code
     return "기타", "기타"
+
+
+def infer_law_from_text(text: str) -> tuple[str, str]:
+    """조문 텍스트 안의 법령명을 기준으로 법령명/코드를 추정한다."""
+    for law_name, law_code in LAW_CODE_MAP.items():
+        if law_name in text:
+            canonical_name = next(
+                (name for name, code in LAW_CODE_MAP.items() if code == law_code and len(name) >= len(law_name)),
+                law_name,
+            )
+            return canonical_name, law_code
+    return "법규 Summary", "기타"
+
+
+def normalize_article_no(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def normalize_match_text(value: str) -> str:
+    value = re.sub(r"\s+", "", str(value or ""))
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", value)[:900]
 
 
 def parse_law_structure(text: str, law_name: str, law_code: str,
@@ -301,6 +325,143 @@ def extract_pdf(path: Path, law_name: str, law_code: str,
     return records
 
 
+def extract_image_pdf_text_with_ocr(path: Path) -> str:
+    """이미지 스캔 PDF를 EasyOCR로 텍스트화한다."""
+    try:
+        import fitz
+        import easyocr
+        import numpy as np
+    except ImportError as exc:
+        print(f"    → OCR 의존성 없음: {exc}")
+        print("       설치: pip install easyocr pymupdf")
+        return ""
+
+    try:
+        reader = easyocr.Reader(["ko", "en"], gpu=False)
+        doc = fitz.open(str(path))
+        max_pages = SUMMARY_OCR_MAX_PAGES or len(doc)
+        max_pages = min(max_pages, len(doc))
+        scale = SUMMARY_OCR_DPI / 72
+        matrix = fitz.Matrix(scale, scale)
+        text_parts = []
+        print(f"    → OCR 시작: {max_pages}/{len(doc)}쪽, {SUMMARY_OCR_DPI}dpi")
+        for page_idx in range(max_pages):
+            page = doc.load_page(page_idx)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            lines = reader.readtext(image, detail=0, paragraph=True)
+            page_text = "\n".join(str(line) for line in lines if str(line).strip())
+            if page_text.strip():
+                text_parts.append(page_text)
+            print(f"      OCR {page_idx + 1}/{max_pages}쪽: {len(page_text):,}자")
+        doc.close()
+        return "\n".join(text_parts)
+    except Exception as exc:
+        print(f"    → OCR 실패: {exc}")
+        return ""
+
+
+def extract_summary_pdf(path: Path) -> list[dict]:
+    """법규 Sumary.pdf를 기준 조문 데이터로 추출한다."""
+    pdf_type = detect_pdf_type(path, sample=10)
+    print(f"  유형: {pdf_type}")
+
+    if pdf_type in ("text", "mixed"):
+        records = extract_pdf(path, "법규 Summary", "기타", "2024-12-31", "original")
+    elif pdf_type == "image":
+        full_text = extract_image_pdf_text_with_ocr(path)
+        if not full_text.strip():
+            return []
+        records = parse_law_structure(
+            full_text, "법규 Summary", "기타", "2024-12-31", path.name, "original"
+        )
+        print(f"    → OCR 추출: {len(records)}개 항목")
+    else:
+        print("  → 알 수 없는 PDF 유형입니다. 건너뜁니다.")
+        return []
+
+    for record in records:
+        text = " ".join([
+            str(record.get("법령명", "")),
+            str(record.get("조문제목", "")),
+            str(record.get("조문내용", "")),
+        ])
+        law_name, law_code = infer_law_from_text(text)
+        if law_code != "기타":
+            record["법령명"] = law_name
+            record["법령코드"] = law_code
+        record["출처파일"] = path.name
+        record["개정여부"] = "original"
+        record["검색텍스트"] = (
+            f"{record.get('법령명', '')} {record.get('조문번호', '')} "
+            f"{record.get('조문제목', '')} {record.get('조문내용', '')}"
+        )[:1500]
+    return records
+
+
+def link_amendments_to_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """개정 행을 Summary 기준 조문에 연결한다."""
+    df = df.copy()
+    if "기준조문ID" not in df.columns:
+        df["기준조문ID"] = ""
+    if "기준연결방식" not in df.columns:
+        df["기준연결방식"] = ""
+
+    summary_mask = df["개정여부"].eq("original") & df["출처파일"].astype(str).str.contains("법규 Sumary.pdf|법규 Summary.pdf", case=False, regex=True, na=False)
+    summary_df = df[summary_mask].copy()
+    if summary_df.empty:
+        print("  → Summary 기준 조문이 없어 개정사항 연결을 건너뜁니다.")
+        return df
+
+    exact_lookup: dict[tuple[str, str], int] = {}
+    summary_by_law: dict[str, list[tuple[int, str]]] = {}
+    for idx, row in summary_df.iterrows():
+        base_id = str(row.get("id", "")).strip()
+        law = str(row.get("법령명", "")).strip()
+        article = normalize_article_no(row.get("조문번호", ""))
+        if law and article and (law, article) not in exact_lookup:
+            exact_lookup[(law, article)] = idx
+        match_text = normalize_match_text(f"{row.get('조문제목', '')} {row.get('조문내용', '')}")
+        summary_by_law.setdefault(law, []).append((idx, match_text))
+        df.loc[idx, "기준조문ID"] = base_id
+        df.loc[idx, "기준연결방식"] = "summary"
+
+    linked = 0
+    amendment_mask = df["개정여부"].isin(["amended", "new"])
+    for idx, row in df[amendment_mask].iterrows():
+        law = str(row.get("법령명", "")).strip()
+        article = normalize_article_no(row.get("조문번호", ""))
+        exact_idx = exact_lookup.get((law, article))
+        if exact_idx is not None:
+            df.loc[idx, "기준조문ID"] = str(df.loc[exact_idx, "id"])
+            df.loc[idx, "기준연결방식"] = "법령명+조문번호"
+            linked += 1
+            continue
+
+        candidates = summary_by_law.get(law, [])
+        target_text = normalize_match_text(f"{row.get('조문제목', '')} {row.get('조문내용', '')}")
+        best_idx = None
+        best_score = 0.0
+        if target_text:
+            for cand_idx, cand_text in candidates:
+                if not cand_text:
+                    continue
+                score = SequenceMatcher(None, target_text, cand_text).ratio()
+                if score > best_score:
+                    best_idx = cand_idx
+                    best_score = score
+
+        if best_idx is not None and best_score >= 0.35:
+            df.loc[idx, "기준조문ID"] = str(df.loc[best_idx, "id"])
+            df.loc[idx, "기준연결방식"] = f"내용유사도 {best_score:.2f}"
+            linked += 1
+        else:
+            df.loc[idx, "기준연결방식"] = "미연결(신규 가능)"
+
+    print(f"  → Summary 기준 연결: {linked:,}/{int(amendment_mask.sum()):,}개 개정·신설 항목")
+    return df
+
+
 def try_hwp_extraction(path: Path) -> str:
     """hwp5txt로 HWP 텍스트 추출 시도."""
     try:
@@ -340,7 +501,16 @@ def main():
     all_records: list[dict] = []
     history_records: list[dict] = []
 
-    # ── 1. 25년 이후 법개정 PDF 처리 ─────────────────────────────────────────
+    # ── 1. 법규 Sumary.pdf를 기준 데이터로 먼저 처리 ─────────────────────────
+    if SUMARY_PDF.exists():
+        print(f"\n[법규 Sumary.pdf] 기준 데이터 처리 중...")
+        records = extract_summary_pdf(SUMARY_PDF)
+        print(f"  → 법규 Sumary 기준 추출: {len(records)}개 항목")
+        all_records.extend(records)
+    else:
+        print(f"\n⚠️  법규 Sumary.pdf 없음: {SUMARY_PDF}")
+
+    # ── 2. 25년 이후 법개정 PDF 처리 ─────────────────────────────────────────
     if AMENDMENT_DIR.exists():
         pdf_files = sorted(AMENDMENT_DIR.glob("*.pdf"))
         print(f"\n[25년 이후 법개정] PDF {len(pdf_files)}개 처리 시작...")
@@ -372,24 +542,6 @@ def main():
     else:
         print(f"\n⚠️  '25년 이후 법개정' 폴더 없음: {AMENDMENT_DIR}")
 
-    # ── 2. 법규 Sumary.pdf 처리 ───────────────────────────────────────────────
-    if SUMARY_PDF.exists():
-        print(f"\n[법규 Sumary.pdf] 처리 중...")
-        pdf_type = detect_pdf_type(SUMARY_PDF, sample=10)
-        print(f"  유형: {pdf_type}")
-        if pdf_type in ("text", "mixed"):
-            # 법규 Sumary는 법령별로 구분하기 어려우므로 "법규요약" 단일 카테고리로 처리
-            law_name, law_code = "법규 요약", "기타"
-            enforcement_date = "2024-12-31"
-            records = extract_pdf(SUMARY_PDF, law_name, law_code, enforcement_date, "original")
-            print(f"  → 법규 Sumary 추출: {len(records)}개 항목")
-            all_records.extend(records)
-        else:
-            print("  → 이미지 스캔. 건너뜁니다.")
-            print("     (필요하면 EasyOCR 옵션을 별도 협의하세요)")
-    else:
-        print(f"\n⚠️  법규 Sumary.pdf 없음: {SUMARY_PDF}")
-
     # ── 3. 수동 입력 데이터 병합 ──────────────────────────────────────────────
     manual = load_manual_input()
     if manual:
@@ -407,7 +559,7 @@ def main():
     required_cols = [
         "id", "법령명", "법령코드", "편장절", "조문번호", "조문제목",
         "조문내용", "시행일", "개정여부", "개정내용요약",
-        "개정전조문내용", "변경유형", "출처파일", "검색텍스트"
+        "개정전조문내용", "변경유형", "출처파일", "기준조문ID", "기준연결방식", "검색텍스트"
     ]
     for col in required_cols:
         if col not in df.columns:
@@ -419,6 +571,9 @@ def main():
     # id 재부여
     df = df.reset_index(drop=True)
     df["id"] = df.index + 1
+    df["id"] = df["id"].astype(str)
+
+    df = link_amendments_to_summary(df)
 
     # 컬럼 순서 정렬
     df = df[required_cols]

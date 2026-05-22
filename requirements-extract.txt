@@ -8,5 +8,5 @@ pymupdf
 # HWP 파싱 시도
 olefile
 
-# 이미지 스캔 PDF OCR (필요한 경우에만 설치 — 용량 큼)
-# easyocr
+# 이미지 스캔 PDF OCR (법규 Sumary.pdf 기준 추출에 필요 — 용량 큼)
+easyocr
